@@ -1,4 +1,4 @@
-# Advanced-Brain-Coverage
+# Brain-Coverage
 
 Attribution: This repository contains code adapted from the DCAN-Labs `brain_coverage` project:
 - Upstream source: https://github.com/DCAN-Labs/brain_coverage
