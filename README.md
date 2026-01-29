@@ -2,7 +2,7 @@
 
 This repository implements a two-stage workflow for computing brain coverage metrics from qsiprep-preprocessed diffusion MRI data.
 
-First, a preprocessing script applies MNI-space anatomical masks (e.g., cerebrum, cerebellum, brainstem) to each subject’s native ACPC diffusion space. This step produces subject-specific, region-level brain masks that are spatially aligned to the diffusion data.
+First, a preprocessing script applies MNI-space anatomical masks (e.g., cerebrum, cerebellum, brainstem) to each subject’s native ACPC diffusion space. The specific masks used in this step are uploaded in this repository in the masks folder. This step produces subject-specific, region-level brain masks that are spatially aligned to the diffusion data.
 
 Second, a coverage computation script uses these subject-specific masks to quantify the proportion of each region that is covered by the diffusion data. Coverage is computed by thresholding the mean diffusion image, applying the region mask, and calculating the percentage of nonzero voxels relative to the
 full mask extent.
