@@ -1,214 +1,152 @@
 #!/usr/bin/env python3
 # =============================================================================
-# Purpose: Calculate brain coverage for each subject’s DWI data using a
-#          subject-specific ACPC-space brain mask and output results to QC dir.
-#
-# Adapted from: https://github.com/DCAN-Labs/brain_coverage
-# Created on 11/13/25 by Samantha Keppler
+# Purpose: Calculate brain coverage for each subject’s DWI data using ACPC-space
+#          masks (whole brain + dseg region masks) and output results to QC dir.
+#          Outputs participant_id + coverage per region (no sessions).
+# Adapted on 1/22/26 by Samantha Keppler
 # =============================================================================
+
+import os
+import shutil
+from glob import glob
+from datetime import datetime
+from typing import Optional
+
+import pandas as pd
+import nibabel as nib
+from nipype.interfaces import fsl
+from nipype.interfaces.fsl.maths import MathsCommand
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
 
 CONFIG = {
-    # Dataset-level identifiers
     "base_path": "/mnt/synapse/neurocat-lab/R21MH133229_asd_dmri_lifespan/datasets_v1.0",
     "dataset_name": "abideii-ip",
-    "qsiprep_version": "qsiprep-1.0.0rc2",
 
-    # Diffusion metadata
-    "dir_tag": "PA",
+    # Deterministic identifier for the intended DWI series (no wildcard).
+    # Example: "dir-PA_space-ACPC" or "dir-PA_run-01_space-ACPC"
+    # Can be overridden at runtime with environment variable DWI_PREFIX
+    "dwi_prefix": "dir-PA_space-ACPC",
 
-    # Directory structure
-    "dirs": {
-        "derivatives": "derivatives",
-        "qc": "qc",
-        "tmp": "tmp",
-        "dwi": "dwi",
-    },
-
-    # Path templates
     "paths": {
-        "bids_root": "{base}/{dataset}",
-
-        "qsiprep_root": (
-            "{base}/{dataset}/{derivatives}/{qsiprep}"
-        ),
-
-        "subject_root": (
-            "{base}/{dataset}/{derivatives}/{qsiprep}/{subj}"
-        ),
-
-        "brain_mask": (
-            "{base}/{dataset}/{derivatives}/{qsiprep}/{subj}/dwi/"
-            "{subj}_space-ACPC_mni_icbm152_brain_coverage_mask.nii.gz"
-        ),
-
-        "dwi_preproc": (
-            "{base}/{dataset}/{derivatives}/{qsiprep}/{subj}/dwi/"
-            "{subj}_dir-*_space-ACPC_desc-preproc_dwi.nii.gz"
-        ),
-
-        "qc_dir": (
-            "{base}/{dataset}/{derivatives}/{qsiprep}/{qc}"
-        ),
-
-        "output_tsv": (
-            "{base}/{dataset}/{derivatives}/{qsiprep}/{qc}/brain_coverage.tsv"
-        ),
+        "qsiprep_root": "{base}/{dataset}/derivatives/qsiprep-1.0.0rc2",
+        "output_dir": "{base}/{dataset}/derivatives/qsiprep-1.0.0rc2/qc",
+        "output_tsv": "{base}/{dataset}/derivatives/qsiprep-1.0.0rc2/qc/brain_dseg_masks_coverage.tsv",
     },
 
-    # Runtime options
+    # Brainstem intentionally excluded per advisor guidance
+    "mask_templates": {
+        "icbm152": "{qsiprep_root}/{subj}/dwi/{subj}_space-ACPC_mni_icbm152_brain_coverage_mask.nii.gz",
+        "cerebrum": "{qsiprep_root}/{subj}/dwi/{subj}_space-ACPC_mni_cerebrum_brain_coverage_mask.nii.gz",
+        "cerebellum_and_midbrain": "{qsiprep_root}/{subj}/dwi/{subj}_space-ACPC_mni_cerebellum_and_midbrain_brain_coverage_mask.nii.gz",
+    },
+
     "options": {
+        # If deterministic dwi (built from dwi_prefix) is missing, allow trying a wildcard fallback.
+        # Set False to enforce strict deterministic behavior.
+        "allow_wildcard_fallback": True,
         "keep_intermediates": False,
         "verbose": True,
-    },
+    }
 }
-
-# =============================================================================
-# IMPORTS
-# =============================================================================
-
-import os
-import sys
-import shutil
-from glob import glob
-from datetime import datetime
-
-import pandas as pd
-import nibabel as nib
-from nibabel import imagestats
-from nipype.interfaces import fsl
-from nipype.interfaces.fsl.maths import MathsCommand
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
-class LazyDict(dict):
-    def __getattr__(self, key):
-        return self[key]
-
-    def __setattr__(self, key, value):
-        self[key] = value
+def count_nonzero_voxels(img_path: str) -> float:
+    data = nib.load(img_path).get_fdata()
+    return float((data != 0).sum())
 
 
-def get_cli_args_from_config(config):
-    base = config["base_path"]
-    dataset = config["dataset_name"]
-    qsiprep = config["qsiprep_version"]
-    dirs = config["dirs"]
-
-    paths = {
-        k: v.format(
-            base=base,
-            dataset=dataset,
-            qsiprep=qsiprep,
-            derivatives=dirs["derivatives"],
-            qc=dirs["qc"],
-            subj="{subj}",
-        )
-        for k, v in config["paths"].items()
-    }
-
-    qc_dir = paths["qc_dir"]
-
-    return {
-        "paths": paths,
-        "qc_dir": qc_dir,
-        "work_dir": os.path.join(qc_dir, dirs["tmp"]),
-        "failed_file": os.path.join(qc_dir, "failed_bc_runs.txt"),
-        "keep": config["options"]["keep_intermediates"],
-        "verbose": config["options"]["verbose"],
-    }
-
-
-def get_subject_list(qsiprep_root):
-    subj_paths = [
-        p for p in glob(os.path.join(qsiprep_root, "sub-*"))
+def get_subject_list(qsiprep_root: str):
+    subs = sorted(
+        os.path.basename(p)
+        for p in glob(os.path.join(qsiprep_root, "sub-*"))
         if os.path.isdir(p)
-    ]
-    subj_ids = [os.path.basename(p) for p in subj_paths]
-
-    if not subj_ids:
-        sys.exit(f"No subject folders found under {qsiprep_root}")
-
-    return subj_ids
-
-
-def get_image_paths(subj, cli_args):
-    temp_dir = os.path.join(cli_args["work_dir"], subj)
-    os.makedirs(temp_dir, exist_ok=True)
-
-    path_to = LazyDict({
-        "MNI": cli_args["paths"]["brain_mask"].format(subj=subj),
-        "temp_dir": temp_dir,
-        "prefiltered": os.path.join(temp_dir, f"{subj}_prefiltered.nii.gz"),
-        "bold": os.path.join(temp_dir, f"{subj}_bold_mean.nii.gz"),
-        "mask": os.path.join(temp_dir, f"{subj}_bold_mask.nii.gz"),
-        "mask_masked": os.path.join(temp_dir, f"{subj}_bold_mask_masked.nii.gz"),
-    })
-
-    return path_to
-
-
-def calculate_coverage(subj, cli_args):
-    path_to = get_image_paths(subj, cli_args)
-
-    dwi_files = glob(
-        cli_args["paths"]["dwi_preproc"].format(subj=subj)
     )
+    if not subs:
+        raise RuntimeError(f"No subject folders found under: {qsiprep_root}")
+    return subs
 
-    if not dwi_files:
-        print(f"No DWI file found for {subj}")
+
+def find_preproc_dwi(subj: str, qsiprep_root: str, dwi_prefix: str, allow_fallback: bool) -> Optional[str]:
+    """
+    Primary behavior: deterministic filename using dwi_prefix (no wildcard).
+    If that file does not exist and allow_fallback is True, try a glob wildcard
+    as a fallback and pick the first match (with a warning).
+    """
+    expected = os.path.join(qsiprep_root, subj, "dwi", f"{subj}_{dwi_prefix}_desc-preproc_dwi.nii.gz")
+    if os.path.exists(expected):
+        return expected
+
+    # deterministic file missing
+    if not allow_fallback:
         return None
 
-    dwi_file = dwi_files[0]
+    # Try a safe wildcard fallback (only within the subject's dwi folder)
+    pattern = os.path.join(qsiprep_root, subj, "dwi", f"{subj}_*_desc-preproc_dwi.nii.gz")
+    candidates = sorted(glob(pattern))
+    if candidates:
+        # warn the user and return the first candidate
+        print(f"  [WARN] Deterministic DWI not found for {subj} (expected: {os.path.basename(expected)}).")
+        print(f"         Falling back to first match: {os.path.basename(candidates[0])}")
+        return candidates[0]
+    # nothing found
+    return None
+
+
+def compute_coverage(subj: str, dwi_file: str, mask_file: str, work_dir: str) -> Optional[float]:
+    subj_tmp = os.path.join(work_dir, subj)
+    os.makedirs(subj_tmp, exist_ok=True)
+
+    dwi_float = os.path.join(subj_tmp, f"{subj}_dwi_float.nii.gz")
+    dwi_mean = os.path.join(subj_tmp, f"{subj}_dwi_meanT.nii.gz")
+    dwi_mean_bin = os.path.join(subj_tmp, f"{subj}_dwi_meanT_bin.nii.gz")
+    masked = os.path.join(subj_tmp, f"{subj}_masked.nii.gz")
 
     MathsCommand(
         in_file=dwi_file,
-        out_file=path_to.prefiltered,
+        out_file=dwi_float,
         output_datatype="float",
-        output_type="NIFTI_GZ",
+        output_type="NIFTI_GZ"
     ).run()
 
-    if not os.path.exists(path_to.prefiltered):
-        print(f"Failed to create prefiltered file for {subj}")
+    if not os.path.exists(dwi_float):
         return None
 
     fsl.MeanImage(
-        in_file=path_to.prefiltered,
+        in_file=dwi_float,
+        out_file=dwi_mean,
         dimension="T",
-        out_file=path_to.bold,
-        output_type="NIFTI_GZ",
+        output_type="NIFTI_GZ"
     ).run()
 
     fsl.UnaryMaths(
-        in_file=path_to.bold,
+        in_file=dwi_mean,
+        out_file=dwi_mean_bin,
         operation="bin",
-        out_file=path_to.mask,
-        output_type="NIFTI_GZ",
+        output_type="NIFTI_GZ"
     ).run()
 
     fsl.ApplyMask(
-        in_file=path_to.mask,
-        mask_file=path_to.MNI,
-        out_file=path_to.mask_masked,
-        output_type="NIFTI_GZ",
+        in_file=dwi_mean_bin,
+        mask_file=mask_file,
+        out_file=masked,
+        output_type="NIFTI_GZ"
     ).run()
 
-    n_vox = {
-        img: float(imagestats.count_nonzero_voxels(nib.load(path_to[img])))
-        for img in ("mask_masked", "MNI")
-    }
+    if not os.path.exists(masked):
+        return None
 
-    coverage = round((n_vox["mask_masked"] / n_vox["MNI"]) * 100, 3)
+    n_mask = count_nonzero_voxels(mask_file)
+    if n_mask == 0:
+        return None
 
-    if not cli_args["keep"]:
-        shutil.rmtree(path_to.temp_dir, ignore_errors=True)
-
-    return coverage
+    n_cov = count_nonzero_voxels(masked)
+    return round((n_cov / n_mask) * 100.0, 3)
 
 
 # =============================================================================
@@ -216,41 +154,71 @@ def calculate_coverage(subj, cli_args):
 # =============================================================================
 
 def main():
-    cli_args = get_cli_args_from_config(CONFIG)
+    base = CONFIG["base_path"]
+    dataset = CONFIG["dataset_name"]
 
-    os.makedirs(cli_args["qc_dir"], exist_ok=True)
-    os.makedirs(cli_args["work_dir"], exist_ok=True)
+    # allow environment override for quick tests / different runs
+    env_prefix = os.environ.get("DWI_PREFIX")
+    dwi_prefix = env_prefix if env_prefix is not None else CONFIG["dwi_prefix"]
+
+    qsiprep_root = CONFIG["paths"]["qsiprep_root"].format(base=base, dataset=dataset)
+    output_dir = CONFIG["paths"]["output_dir"].format(base=base, dataset=dataset)
+    out_tsv = CONFIG["paths"]["output_tsv"].format(base=base, dataset=dataset)
+
+    os.makedirs(output_dir, exist_ok=True)
+    work_dir = os.path.join(output_dir, "tmp")
+    os.makedirs(work_dir, exist_ok=True)
+
+    mask_templates = {
+        k: v.format(qsiprep_root=qsiprep_root, subj="{subj}")
+        for k, v in CONFIG["mask_templates"].items()
+    }
+
+    subjects = get_subject_list(qsiprep_root)
+    total = len(subjects)
 
     start = datetime.now()
     print(f"Started at {start}")
+    print(f"Using DWI prefix: {dwi_prefix} (allow fallback: {CONFIG['options']['allow_wildcard_fallback']})")
 
-    subjects = get_subject_list(
-        cli_args["paths"]["qsiprep_root"]
-    )
-
-    results = []
-    total = len(subjects)
-
+    rows = []
     for i, subj in enumerate(subjects, 1):
-        print(f"[{i}/{total}] Calculating coverage for {subj} ...", flush=True)
-        cov = calculate_coverage(subj, cli_args)
-        if cov is not None:
-            results.append({
-                "participant_id": subj,
-                "brain_coverage": cov,
-            })
+        print(f"[{i}/{total}] Processing {subj} ...", flush=True)
 
-    if not results:
-        sys.exit("No coverage values calculated. Check DWI paths.")
+        dwi_file = find_preproc_dwi(subj, qsiprep_root, dwi_prefix, CONFIG["options"]["allow_wildcard_fallback"])
 
-    df = pd.DataFrame(results)
-    df.to_csv(cli_args["paths"]["output_tsv"], sep="\t", index=False)
+        row = {"participant_id": subj}
+        if dwi_file is None:
+            if CONFIG["options"]["verbose"]:
+                print(f"  [WARN] Missing DWI for {subj} (expected {subj}_{dwi_prefix}_desc-preproc_dwi.nii.gz)")
+            for name in mask_templates:
+                row[f"brain_coverage_{name}"] = None
+            rows.append(row)
+            continue
 
-    print(f"\nSaved QC results to: {cli_args['paths']['output_tsv']}")
+        for name, tmpl in mask_templates.items():
+            mask_file = tmpl.format(subj=subj)
+            if not os.path.exists(mask_file):
+                if CONFIG["options"]["verbose"]:
+                    print(f"  [WARN] Missing mask for {subj}: {mask_file}")
+                row[f"brain_coverage_{name}"] = None
+                continue
+
+            row[f"brain_coverage_{name}"] = compute_coverage(
+                subj, dwi_file, mask_file, work_dir
+            )
+
+        rows.append(row)
+
+        if not CONFIG["options"]["keep_intermediates"]:
+            shutil.rmtree(os.path.join(work_dir, subj), ignore_errors=True)
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out_tsv, sep="\t", index=False)
+
+    print(f"\nSaved QC results to: {out_tsv}")
     print(f"Total runtime: {datetime.now() - start}")
 
 
 if __name__ == "__main__":
     main()
-
-
