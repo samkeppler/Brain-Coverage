@@ -17,8 +17,9 @@ Modifications in this repository include:
      - This implementation does not modify participants.tsv. Output is written to a standalone QC TSV containing          only participant_id and a single brain coverage metric.
   4. Simplified subject handling
      - The upstream script supports explicit subject and session selection, wildcard matching, and multi-session          datasets.
-     - This implementation automatically discovers subjects by scanning qsiprep derivatives
-       (derivatives/<qsiprep_version>/sub-*) and assumes a single DWI series per subject.
+     - This implementation removes user-specified wildcard filtering and instead uses a fixed file discovery
+       pattern to automatically discover qsiprep-preprocessed DWI outputs. It specifically searches for files
+       matching: *_dir-*_space-ACPC_desc-preproc_dwi.nii.gz
   5. Subject-specific ACPC-space mask usage
      - The upstream script accepts an arbitrary MNI mask at runtime.
      - This implementation uses a subject-specific ACPC-space brain coverage mask with a deterministic filename
